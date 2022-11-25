@@ -21,6 +21,8 @@ from ....samplers.creator import create_sampler
 from ....statistics.statistics import TensorStatistic
 from ....utils.logger import get_logger
 from ....utils.telemetry import send_event
+from ....engines.ie_engine import IEEngine
+from openvino.tools.pot.data_loaders.creator import create_data_loader
 
 logger = get_logger(__name__)
 
@@ -417,20 +419,70 @@ class AccuracyAwareCommon(Algorithm):
         eu.select_evaluation_dataset(self._engine)
 
         fake_quantize_nodes = get_nodes_by_type(model, ['FakeQuantize'])
-        for node in fake_quantize_nodes:
-            if excluded_nodes and node.fullname in excluded_nodes:
-                continue
-            if node.fullname not in change_fqs:
-                modified_model, modified_fq_layers, _ = self._modify_model_in_scope(deepcopy(model), [node.fullname])
-                if not modified_fq_layers:
-                    continue
-                logger.debug('Changed\\Removed a block of %d FQ layers: %s', len(modified_fq_layers),
-                             modified_fq_layers)
-                change_fqs += modified_fq_layers
-                logger.update_progress(self._config.ranking_subset_size)
-                node_importance_score[node.fullname] = self._get_score(modified_model,
-                                                                       list(ranking_subset),
-                                                                       metric_name)
+        batch_size = 150
+        import time
+        from threading import Thread
+        engines_pool = []
+        threads_poll = []
+
+        def set_model_in_a_process(engine, modified_model):
+            engine.set_model(modified_model)
+        try:
+            for i in range(0, len(fake_quantize_nodes), batch_size):
+                logger.debug(f'Process first {batch_size} elements')
+                fq_batch = fake_quantize_nodes[i:i + batch_size]
+                for node in fq_batch:
+                    if excluded_nodes and node.fullname in excluded_nodes:
+                        continue
+                    if node.fullname not in change_fqs:
+
+                        _start = time.time()
+                        modified_model, modified_fq_layers, _ = self._modify_model_in_scope(deepcopy(model), [node.fullname])
+                        logger.debug(f'Model modification time: {time.time() - _start}')
+
+                        if not modified_fq_layers:
+                            continue
+                        logger.debug('Changed\\Removed a block of %d FQ layers: %s', len(modified_fq_layers),
+                                     modified_fq_layers)
+                        change_fqs += modified_fq_layers
+
+
+                        _start = time.time()
+                        dl = create_data_loader(self._config.engine, modified_model)
+                        eng = IEEngine(self._config.engine, dl)
+                        engines_pool.append(eng)
+                        threads_poll.append(Thread(target=set_model_in_a_process, args=(engines_pool[-1], modified_model)))
+                        threads_poll[-1].start()
+                        #self._engine.set_model(modified_model)
+                        logger.debug(f'Set model time: {time.time() - _start}')
+
+                for thread in threads_poll:
+                    thread.join()
+
+                for node, engine in zip(fq_batch, engines_pool):
+                    engine.allow_pairwise_subset = True
+                    _start = time.time()
+                    index_sampler = create_sampler(engine, samples=list(ranking_subset))
+                    logger.debug(f'Sampler creation time: {time.time() - _start}')
+
+                    engine._metric = self._engine.metric
+                    metrics, *_ = engine.predict(sampler=index_sampler)
+                    engine.allow_pairwise_subset = False
+                    logger.update_progress(self._config.ranking_subset_size)
+                    ranking_metric = self._metrics_config[metric_name].ranking
+                    #breakpoint()
+                    baseline = self._baseline_metric[ranking_metric.name]
+                    quantized = metrics[ranking_metric.name]
+                    _accuracy_drop = baseline - quantized
+                    logger.debug(f'Currend accuracy drop: {_accuracy_drop}')
+                    if _accuracy_drop < self._config.maximal_drop:
+                        logger.info(f'!!!Model with removed FQ layers {modified_fq_layers} achives {_accuracy_drop}!!!')
+
+                    _start = time.time()
+                    node_importance_score[node.fullname] = ranking_metric.comparator(metrics[ranking_metric.name])
+                    logger.debug(f'Importance calculation time: {time.time() - _start}')
+        except:
+            breakpoint()
 
         eu.reset_dataset_to_default(self._engine)
 
